@@ -71,13 +71,11 @@ fn main() {
     println!("Starting trace_processor_shell...");
     println!("  Path: {}", trace_processor_path.display());
     println!("  HTTP port: 10001");
-    println!("  CORS origins: http://localhost:10000, http://127.0.0.1:10000");
 
     let mut trace_processor = Command::new(&trace_processor_path)
         .args([
             "-D",
             "--http-port", "10001",
-            "--http-additional-cors-origins", "http://localhost:10000,http://127.0.0.1:10000",
         ])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
