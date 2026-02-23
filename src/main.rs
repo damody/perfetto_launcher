@@ -5,6 +5,14 @@ use std::process::{Command, Stdio};
 use std::thread;
 use tiny_http::{Header, Response, Server};
 
+fn get_available_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("Failed to bind to any port")
+        .local_addr()
+        .expect("Failed to get local address")
+        .port()
+}
+
 /// Get the dist directory path (parent of the executable's directory)
 fn get_dist_dir() -> PathBuf {
     let exe_path = env::current_exe().expect("Failed to get executable path");
@@ -68,15 +76,26 @@ fn main() {
     }
 
     // Start trace_processor_shell
+    let rpc_port = get_available_port();
     println!("Starting trace_processor_shell...");
     println!("  Path: {}", trace_processor_path.display());
-    println!("  HTTP port: 10001");
+    println!("  HTTP port: {}", rpc_port);
+
+    let mut args = vec!["-D".to_string(), "--http-port".to_string(), rpc_port.to_string()];
+    
+    // Check if a trace file was provided as a command line argument
+    if let Some(arg) = env::args().nth(1) {
+        let path = Path::new(&arg);
+        if path.exists() {
+            println!("  Loading trace file: {}", arg);
+            args.push(arg);
+        } else {
+            eprintln!("Warning: Provided trace file does not exist: {}", arg);
+        }
+    }
 
     let mut trace_processor = Command::new(&trace_processor_path)
-        .args([
-            "-D",
-            "--http-port", "10001",
-        ])
+        .args(&args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -87,18 +106,20 @@ fn main() {
     thread::sleep(std::time::Duration::from_millis(500));
 
     // Start HTTP server
-    println!("\nStarting HTTP server on port 10000...");
-    let server = Server::http("0.0.0.0:10000").expect("Failed to start HTTP server");
+    let http_port = get_available_port();
+    println!("\nStarting HTTP server on port {}...", http_port);
+    let server = Server::http(format!("0.0.0.0:{}", http_port)).expect("Failed to start HTTP server");
 
+    let ui_url = format!("http://localhost:{}/?rpc_port={}", http_port, rpc_port);
     println!("\n=== Perfetto is ready! ===");
-    println!("  UI Server:            http://localhost:10000/");
-    println!("  Trace Processor RPC:  http://localhost:10001/");
+    println!("  UI Server:            http://localhost:{}/", http_port);
+    println!("  Trace Processor RPC:  http://localhost:{}/", rpc_port);
     println!("\nPress Ctrl+C to stop.\n");
 
     // Open browser
-    if let Err(e) = open::that("http://localhost:10000/") {
+    if let Err(e) = open::that(&ui_url) {
         eprintln!("Warning: Failed to open browser: {}", e);
-        println!("Please open http://localhost:10000/ manually.");
+        println!("Please open {} manually.", ui_url);
     }
 
     // Handle requests
