@@ -13,6 +13,21 @@ fn get_available_port() -> u16 {
         .port()
 }
 
+fn get_available_port_with_offset(offset: u16) -> u16 {
+    for _ in 0..20 {
+        let base = get_available_port();
+        let candidate = base as u32 + offset as u32;
+        if candidate > u16::MAX as u32 {
+            continue;
+        }
+        let port = candidate as u16;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    get_available_port()
+}
+
 /// Get the dist directory path (parent of the executable's directory)
 fn get_dist_dir() -> PathBuf {
     let exe_path = env::current_exe().expect("Failed to get executable path");
@@ -75,13 +90,30 @@ fn main() {
         return;
     }
 
-    // Start trace_processor_shell
-    let rpc_port = get_available_port();
+    // Pre-allocate ports so we can configure CORS on trace_processor_shell
+    // before the UI HTTP server starts.
+    let rpc_port = get_available_port_with_offset(10000);
+    let mut http_port = get_available_port_with_offset(10000);
+    while http_port == rpc_port {
+        http_port = get_available_port_with_offset(10000);
+    }
     println!("Starting trace_processor_shell...");
     println!("  Path: {}", trace_processor_path.display());
     println!("  HTTP port: {}", rpc_port);
 
-    let mut args = vec!["-D".to_string(), "--http-port".to_string(), rpc_port.to_string()];
+    let cors_origins = format!(
+        "http://localhost:{},http://127.0.0.1:{}",
+        http_port, http_port
+    );
+    let mut args = vec![
+        "-D".to_string(),
+        "--http-ip-address".to_string(),
+        "127.0.0.1".to_string(),
+        "--http-port".to_string(),
+        rpc_port.to_string(),
+        "--http-additional-cors-origins".to_string(),
+        cors_origins,
+    ];
     
     // Check if a trace file was provided as a command line argument
     if let Some(arg) = env::args().nth(1) {
@@ -106,7 +138,6 @@ fn main() {
     thread::sleep(std::time::Duration::from_millis(500));
 
     // Start HTTP server
-    let http_port = get_available_port();
     println!("\nStarting HTTP server on port {}...", http_port);
     let server = Server::http(format!("0.0.0.0:{}", http_port)).expect("Failed to start HTTP server");
 
