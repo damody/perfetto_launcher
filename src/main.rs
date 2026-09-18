@@ -1,9 +1,90 @@
 use std::env;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 use tiny_http::{Header, Response, Server};
+
+fn rpc_port_is_ready(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(200),
+    )
+    .is_ok()
+}
+
+fn trace_output_indicates_loaded(chunk: &str) -> bool {
+    chunk.contains("Trace loaded")
+}
+
+fn pump_processor_output(mut stream: impl Read + Send + 'static, loaded: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut leftover = Vec::new();
+        loop {
+            let n = match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            leftover.extend_from_slice(&buf[..n]);
+            while let Some(pos) = leftover.iter().position(|&b| b == b'\n' || b == b'\r') {
+                let line = String::from_utf8_lossy(&leftover[..pos]).into_owned();
+                leftover.drain(..=pos);
+                if trace_output_indicates_loaded(&line) {
+                    loaded.store(true, Ordering::SeqCst);
+                }
+                if !line.is_empty() {
+                    let _ = writeln!(std::io::stderr(), "{line}");
+                }
+            }
+        }
+        if leftover.is_empty() {
+            return;
+        }
+        let line = String::from_utf8_lossy(&leftover);
+        if trace_output_indicates_loaded(&line) {
+            loaded.store(true, Ordering::SeqCst);
+        }
+        if !line.trim().is_empty() {
+            let _ = writeln!(std::io::stderr(), "{line}");
+        }
+    });
+}
+
+fn wait_until_ready(
+    child: &mut Child,
+    port: u16,
+    loaded: Option<&AtomicBool>,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(1_800);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!("trace_processor_shell exited early ({status})"));
+            }
+            Ok(None) => {}
+            Err(error) => return Err(format!("wait for trace_processor_shell: {error}")),
+        }
+        let load_done = loaded
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .unwrap_or(true);
+        if load_done && rpc_port_is_ready(port) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "timed out waiting for trace_processor_shell to finish loading".into(),
+            );
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
 
 fn get_available_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -114,13 +195,14 @@ fn main() {
         "--http-additional-cors-origins".to_string(),
         cors_origins,
     ];
-    
-    // Check if a trace file was provided as a command line argument
+
+    let mut loading_trace = false;
     if let Some(arg) = env::args().nth(1) {
         let path = Path::new(&arg);
         if path.exists() {
             println!("  Loading trace file: {}", arg);
             args.push(arg);
+            loading_trace = true;
         } else {
             eprintln!("Warning: Provided trace file does not exist: {}", arg);
         }
@@ -128,16 +210,35 @@ fn main() {
 
     let mut trace_processor = Command::new(&trace_processor_path)
         .args(&args)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("Failed to start trace_processor_shell");
 
-    // Wait for trace_processor to start
-    println!("\nWaiting for trace_processor to start...");
-    thread::sleep(std::time::Duration::from_millis(500));
+    let loaded = Arc::new(AtomicBool::new(!loading_trace));
+    if let Some(stdout) = trace_processor.stdout.take() {
+        pump_processor_output(stdout, Arc::clone(&loaded));
+    }
+    if let Some(stderr) = trace_processor.stderr.take() {
+        pump_processor_output(stderr, Arc::clone(&loaded));
+    }
 
-    // Start HTTP server
+    if loading_trace {
+        println!("\nWaiting until the trace is fully loaded before opening the UI...");
+    } else {
+        println!("\nWaiting for trace_processor RPC...");
+    }
+    if let Err(error) = wait_until_ready(
+        &mut trace_processor,
+        rpc_port,
+        loading_trace.then_some(loaded.as_ref()),
+    ) {
+        eprintln!("Error: {error}");
+        let _ = trace_processor.kill();
+        let _ = trace_processor.wait();
+        return;
+    }
+
     println!("\nStarting HTTP server on port {}...", http_port);
     let server = Server::http(format!("0.0.0.0:{}", http_port)).expect("Failed to start HTTP server");
 
@@ -213,4 +314,27 @@ fn main() {
     let _ = trace_processor.kill();
     let _ = trace_processor.wait();
     println!("Goodbye!");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn rpc_port_is_ready_when_a_listener_accepts() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(rpc_port_is_ready(port));
+        drop(listener);
+        assert!(!rpc_port_is_ready(port));
+    }
+
+    #[test]
+    fn trace_output_indicates_loaded_requires_the_loaded_line() {
+        assert!(!trace_output_indicates_loaded("Loading trace: 402.65 MB"));
+        assert!(trace_output_indicates_loaded(
+            "[799.291] processor_shell.cc:2107 Trace loaded: 584.56 MB in 10.32s (56.6 MB/s)"
+        ));
+    }
 }
